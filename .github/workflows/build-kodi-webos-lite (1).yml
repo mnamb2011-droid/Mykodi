@@ -1,0 +1,181 @@
+name: Build Kodi Lite for LG webOS (.ipk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kodi_branch:
+        description: 'Kodi Git branch to build (used only if repo has no CMakeLists.txt)'
+        required: false
+        default: 'master'
+      use_repo_source:
+        description: 'Build from this repository (true) or clone upstream xbmc/xbmc (false)'
+        required: false
+        default: 'false'
+
+jobs:
+  build-kodi-webos-lite:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
+          df -h
+
+      - name: Install host build dependencies and webOS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint autotools-dev build-essential \
+            ca-certificates ccache cmake curl default-jre-headless flex bison \
+            gawk gettext git gperf libtool m4 make nasm ninja-build \
+            patch pkg-config python3 python3-dev python3-pil rsync \
+            swig tar texinfo unzip xz-utils yasm zip zlib1g-dev \
+            libcurl4-openssl-dev libssl-dev libbz2-dev liblzma-dev \
+            libxml2-dev libexpat1-dev libffi-dev libreadline-dev \
+            libncurses5-dev libsqlite3-dev
+          sudo npm install -g @webos-tools/cli
+          ares-package --version
+
+      - name: Download and configure ARM webOS toolchain (buildroot-nc4)
+        run: |
+          mkdir -p "$HOME/kodi-dev"
+          curl -fL --retry 3 \
+            "https://github.com/openlgtv/buildroot-nc4/releases/download/webos-b17b4cc/arm-webos-linux-gnueabi_sdk-buildroot.tar.gz" \
+            -o "$HOME/kodi-dev/sdk.tar.gz"
+          tar -xzf "$HOME/kodi-dev/sdk.tar.gz" -C "$HOME/kodi-dev"
+          rm -f "$HOME/kodi-dev/sdk.tar.gz"
+          "$HOME/kodi-dev/arm-webos-linux-gnueabi_sdk-buildroot/relocate-sdk.sh"
+
+      - name: Checkout repository (if building from local repo)
+        if: ${{ github.event.inputs.use_repo_source == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          path: kodi
+
+      - name: Clone Kodi source (if building from upstream xbmc/xbmc)
+        if: ${{ github.event.inputs.use_repo_source != 'true' }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.kodi_branch || 'master' }}" \
+            https://github.com/xbmc/xbmc.git kodi
+
+      - name: Inject lightweight USB-only advancedsettings.xml (LG 50NANO75VPA)
+        run: |
+          cat << 'EOF' > kodi/system/advancedsettings.xml
+          <advancedsettings version="1.0">
+            <!-- Lightweight texture/cache limits for LG 50NANO75VPA (~0.95GB free storage) -->
+            <imageres>720</imageres>
+            <fanartres>1080</fanartres>
+            <useddsfanart>false</useddsfanart>
+
+            <!-- Read local .nfo, poster, clearlogo, fanart from USB only -->
+            <videolibrary>
+              <importwatchedstate>true</importwatchedstate>
+              <importresumepoint>true</importresumepoint>
+              <movieextraart>
+                <arttype>clearlogo</arttype>
+                <arttype>clearart</arttype>
+                <arttype>banner</arttype>
+                <arttype>landscape</arttype>
+                <arttype>discart</arttype>
+              </movieextraart>
+              <tvshowextraart>
+                <arttype>clearlogo</arttype>
+                <arttype>clearart</arttype>
+                <arttype>banner</arttype>
+                <arttype>landscape</arttype>
+              </tvshowextraart>
+            </videolibrary>
+
+            <!-- Disable unused network/scanner overhead -->
+            <network>
+              <disableipv6>true</disableipv6>
+            </network>
+            <splash>false</splash>
+            <loglevel>-1</loglevel>
+          </advancedsettings>
+          EOF
+
+      - name: Build Kodi unified dependencies for webOS (32-bit ARM NEON)
+        working-directory: kodi/tools/depends
+        run: |
+          ./bootstrap
+          ./configure \
+            --prefix="$HOME/kodi-deps" \
+            --host=arm-webos-linux-gnueabi \
+            --with-toolchain="$HOME/kodi-dev/arm-webos-linux-gnueabi_sdk-buildroot" \
+            --with-target-cflags="-O2 -march=armv7-a -mfloat-abi=softfp -mfpu=neon" \
+            --with-target-cxxflags="-O2 -march=armv7-a -mfloat-abi=softfp -mfpu=neon" \
+            --enable-debug=no
+          make -j"$(nproc)" || make -j1
+
+      - name: Configure stripped-down Kodi Lite CMake build
+        working-directory: kodi
+        run: |
+          make -C tools/depends/target/cmakebuildsys \
+            BUILD_DIR="$PWD/build" \
+            CMAKE_EXTRA_ARGUMENTS="-DCORE_PLATFORM_NAME=webos \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DENABLE_UPNP=OFF \
+              -DENABLE_AIRTUNES=OFF \
+              -DENABLE_OPTICAL=OFF \
+              -DENABLE_DVDCSS=OFF \
+              -DENABLE_DBUS=OFF \
+              -DENABLE_CEC=OFF \
+              -DENABLE_PIPEWIRE=OFF \
+              -DHAVE_LINUX_UDMABUF=OFF \
+              -DENABLE_TESTING=OFF \
+              -DENABLE_EVENTCLIENTS=OFF \
+              -DENABLE_MYSQLCLIENT=OFF \
+              -DENABLE_MARIADBCLIENT=OFF \
+              -DENABLE_MICROHTTPD=OFF \
+              -DENABLE_AVAHI=OFF \
+              -DENABLE_BLURAY=OFF \
+              -DENABLE_NFS=OFF \
+              -DENABLE_SMBCLIENT=OFF \
+              -DENABLE_LCMS2=OFF"
+
+      - name: Compile Kodi Lite binary
+        working-directory: kodi/build
+        run: |
+          make -j"$(nproc)"
+
+      - name: Bundle, strip unused add-ons, and package .ipk
+        working-directory: kodi/build
+        run: |
+          make bundle
+          # Remove online scrapers, music/weather/web/screensaver add-ons; keep metadata.local & skin.estuary
+          ADDONS_DIR="$PWD/tools/webOS/packaging/addons"
+          rm -rf \
+            "$ADDONS_DIR/audioencoder.kodi.builtin.aac" \
+            "$ADDONS_DIR/audioencoder.kodi.builtin.wma" \
+            "$ADDONS_DIR/game.controller.snes" \
+            "$ADDONS_DIR/metadata.album.universal" \
+            "$ADDONS_DIR/metadata.artists.universal" \
+            "$ADDONS_DIR/metadata.common.allmusic.com" \
+            "$ADDONS_DIR/metadata.common.fanart.tv" \
+            "$ADDONS_DIR/metadata.common.musicbrainz.org" \
+            "$ADDONS_DIR/metadata.common.theaudiodb.com" \
+            "$ADDONS_DIR/metadata.demo.movies" \
+            "$ADDONS_DIR/metadata.demo.tv" \
+            "$ADDONS_DIR/metadata.generic.albums" \
+            "$ADDONS_DIR/metadata.generic.artists" \
+            "$ADDONS_DIR/metadata.themoviedb.org.python" \
+            "$ADDONS_DIR/metadata.tvshows.themoviedb.org.python" \
+            "$ADDONS_DIR/repository.xbmc.org" \
+            "$ADDONS_DIR/resource.images.weathericons.default" \
+            "$ADDONS_DIR/resource.uisounds.kodi" \
+            "$ADDONS_DIR/screensaver.xbmc.builtin.black" \
+            "$ADDONS_DIR/screensaver.xbmc.builtin.dim" \
+            "$ADDONS_DIR/service.xbmc.versioncheck" \
+            "$ADDONS_DIR/webinterface.default"
+          make ipk
+          ls -lh *.ipk
+
+      - name: Upload Kodi Lite .ipk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodi-webos-lite-ipk
+          path: kodi/build/*.ipk
+          retention-days: 30
